@@ -1,1 +1,100 @@
+import streamlit as st
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
 
+st.set_page_config(
+    page_title="공영주차장 안내",
+    layout="wide"
+)
+
+st.title("🚗 공영주차장 정보 안내")
+
+uploaded_file = st.file_uploader(
+    "공영주차장 CSV 업로드",
+    type=["csv"]
+)
+
+if uploaded_file is not None:
+
+    df = pd.read_csv(uploaded_file)
+
+    st.success("CSV 업로드 완료!")
+
+    st.subheader("데이터 미리보기")
+    st.dataframe(df)
+
+    ###############################
+    # 주소 검색
+    ###############################
+
+    keyword = st.text_input("주소 검색")
+
+    result = pd.DataFrame()
+
+    if keyword:
+        result = df[df["주소"].str.contains(keyword, case=False, na=False)]
+
+        st.subheader("검색 결과")
+
+        if len(result) > 0:
+            st.dataframe(result[[
+                "주차장명",
+                "주소",
+                "기본요금",
+                "추가요금"
+            ]])
+
+        else:
+            st.warning("검색 결과가 없습니다.")
+
+    ###############################
+    # 지도
+    ###############################
+
+    center_lat = df["위도"].mean()
+    center_lon = df["경도"].mean()
+
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=12
+    )
+
+    for _, row in df.iterrows():
+
+        color = "blue"
+
+        if keyword:
+            if keyword in row["주소"]:
+                color = "red"
+
+        popup = f"""
+        <b>{row['주차장명']}</b><br>
+        주소 : {row['주소']}<br>
+        기본요금 : {row['기본요금']}<br>
+        추가요금 : {row['추가요금']}
+        """
+
+        tooltip = f"""
+        {row['주차장명']}
+        <br>
+        기본요금 : {row['기본요금']}
+        """
+
+        folium.CircleMarker(
+            location=[row["위도"], row["경도"]],
+            radius=7,
+            color=color,
+            fill=True,
+            fill_opacity=0.8,
+            tooltip=tooltip,
+            popup=popup
+        ).add_to(m)
+
+    st.subheader("공영주차장 지도")
+
+    st_folium(
+        m,
+        width=1200,
+        height=650
+    )
