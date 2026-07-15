@@ -7,35 +7,58 @@ from streamlit_folium import st_folium
 # 페이지 설정
 # -------------------------------
 st.set_page_config(
-    page_title="공영주차장 안내",
+    page_title="공영주차장 정보",
     page_icon="🅿️",
     layout="wide"
 )
 
-st.title("🅿️ 공영주차장 정보 안내")
+st.title("🅿️ 공영주차장 안내 시스템")
 
 st.write("CSV 파일을 업로드하면 주소 검색과 지도를 제공합니다.")
 
 # -------------------------------
 # CSV 업로드
 # -------------------------------
+
 uploaded_file = st.file_uploader(
-    "CSV 파일 업로드",
-    type=["csv"]
+    "공영주차장 CSV 업로드",
+    type="csv"
 )
 
 if uploaded_file is None:
-    st.info("sample_parking.csv 형식의 파일을 업로드하세요.")
+    st.info("CSV 파일을 업로드하세요.")
     st.stop()
 
 # -------------------------------
-# CSV 읽기
+# CSV 읽기 (인코딩 자동 처리)
 # -------------------------------
-try:
-    df = pd.read_csv(uploaded_file)
-except Exception as e:
-    st.error(f"CSV를 읽을 수 없습니다.\n{e}")
+
+encodings = [
+    "utf-8",
+    "utf-8-sig",
+    "cp949",
+    "euc-kr"
+]
+
+df = None
+
+for enc in encodings:
+
+    try:
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file, encoding=enc)
+        break
+
+    except Exception:
+        pass
+
+if df is None:
+    st.error("CSV 파일을 읽을 수 없습니다.\nUTF-8 또는 CP949 형식인지 확인하세요.")
     st.stop()
+
+# -------------------------------
+# 필수 컬럼 검사
+# -------------------------------
 
 required_columns = [
     "주차장명",
@@ -48,15 +71,32 @@ required_columns = [
 
 missing = [c for c in required_columns if c not in df.columns]
 
-if missing:
-    st.error(f"다음 컬럼이 없습니다 : {missing}")
+if len(missing) > 0:
+
+    st.error("다음 컬럼이 없습니다.")
+
+    st.write(missing)
+
     st.stop()
 
-st.success("CSV 업로드 완료")
+# -------------------------------
+# 위도 경도 숫자로 변환
+# -------------------------------
 
-st.subheader("데이터")
+df["위도"] = pd.to_numeric(df["위도"], errors="coerce")
+df["경도"] = pd.to_numeric(df["경도"], errors="coerce")
 
-st.dataframe(df)
+df = df.dropna(subset=["위도", "경도"])
+
+st.success("CSV 업로드 완료!")
+
+# -------------------------------
+# 데이터 보기
+# -------------------------------
+
+with st.expander("데이터 보기"):
+
+    st.dataframe(df)
 
 # -------------------------------
 # 주소 검색
@@ -69,14 +109,21 @@ search_df = df.copy()
 if keyword:
 
     search_df = df[
-        df["주소"].astype(str).str.contains(keyword, case=False)
+        df["주소"].astype(str).str.contains(
+            keyword,
+            case=False,
+            na=False
+        )
     ]
 
     st.subheader("검색 결과")
 
     if len(search_df) == 0:
+
         st.warning("검색 결과가 없습니다.")
+
     else:
+
         st.dataframe(
             search_df[
                 [
@@ -99,7 +146,8 @@ center = [
 
 m = folium.Map(
     location=center,
-    zoom_start=12
+    zoom_start=12,
+    control_scale=True
 )
 
 for _, row in df.iterrows():
@@ -107,19 +155,28 @@ for _, row in df.iterrows():
     color = "blue"
 
     if keyword:
-        if keyword in str(row["주소"]):
+
+        if keyword.lower() in str(row["주소"]).lower():
+
             color = "red"
 
     tooltip = (
-        f"{row['주차장명']}<br>"
-        f"기본요금 : {row['기본요금']}"
+        f"""
+        <b>{row['주차장명']}</b><br>
+        기본요금 : {row['기본요금']}
+        """
     )
 
     popup = (
-        f"<b>{row['주차장명']}</b><br>"
-        f"주소 : {row['주소']}<br>"
-        f"기본요금 : {row['기본요금']}<br>"
-        f"추가요금 : {row['추가요금']}"
+        f"""
+        <b>{row['주차장명']}</b><br><br>
+
+        주소 : {row['주소']}<br>
+
+        기본요금 : {row['기본요금']}<br>
+
+        추가요금 : {row['추가요금']}
+        """
     )
 
     folium.CircleMarker(
@@ -133,10 +190,12 @@ for _, row in df.iterrows():
         popup=popup
     ).add_to(m)
 
-st.subheader("공영주차장 지도")
+st.subheader("🗺️ 공영주차장 지도")
 
 st_folium(
     m,
-    width=1200,
+    width=None,
     height=650
 )
+
+st.caption("🔵 전체 주차장   🔴 검색된 주차장")
