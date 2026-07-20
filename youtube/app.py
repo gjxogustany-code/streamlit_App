@@ -1,156 +1,557 @@
-import streamlit as st
-import os
-
-# --- [중요] 스트림릿 클라우드 자바(JVM) 경로 강제 설정 ---
-# default-jdk가 설치되는 리눅스 표준 경로를 환경 변수에 등록합니다.
-if not os.environ.get("JAVA_HOME"):
-    os.environ["JAVA_HOME"] = "/usr/lib/jvm/default-java"
-
-from googleapiclient.discovery import build
-import pandas as pd
+import html
 import re
-from datetime import datetime
-import matplotlib.pyplot as plt
-from wordcloud import WordCloud
-from konlpy.tag import Okt
 from collections import Counter
+from datetime import timezone
+from urllib.parse import parse_qs, urlparse
 
-# 페이지 설정
-st.set_page_config(page_title="유튜브 댓글 분석기", layout="wide")
-st.title("📊 유튜브 댓글 분석기")
-st.markdown("유튜브 링크와 API 키를 입력하여 댓글의 트렌드와 키워드를 분석해보세요.")
+import matplotlib.pyplot as plt
+import pandas as pd
+import plotly.express as px
+import requests
+import streamlit as st
+from wordcloud import WordCloud
 
-# 폰트 경로 설정 (Streamlit Cloud 리눅스 환경 기준 나눔폰트)
-FONT_PATH = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf"
 
-# --- 사이드바: API 키 및 설정 ---
-st.sidebar.header("⚙️ 설정")
-api_key = st.sidebar.text_input("YouTube API Key를 입력하세요", type="password")
-max_comments = st.sidebar.slider("가져올 댓글 개수 설정", min_value=10, max_value=500, value=100, step=10)
+st.set_page_config(
+    page_title="유튜브 댓글 분석기",
+    page_icon="💬",
+    layout="wide",
+)
 
-# --- 메인 화면: 유튜브 링크 입력 ---
-video_url = st.text_input("유튜브 영상 링크를 입력하세요", placeholder="https://www.youtube.com/watch?v=...")
+st.markdown(
+    """
+    <style>
+    .main-title {
+        font-size: 2.2rem;
+        font-weight: 800;
+        margin-bottom: .2rem;
+    }
+    .sub-title {
+        color: #666;
+        margin-bottom: 1.2rem;
+    }
+    .stMetric {
+        background: rgba(128,128,128,.08);
+        border-radius: 14px;
+        padding: 12px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# 유튜브 URL에서 영상 ID를 정확하게 추출하는 함수
-def extract_video_id(url):
-    if not url:
+YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
+
+POSITIVE_WORDS = {
+    # 한국어
+    "좋다", "좋아요", "좋은", "최고", "멋지다", "멋져", "훌륭", "감동", "재밌다", "재미있다",
+    "재밌어요", "웃기다", "웃겨", "사랑", "행복", "추천", "감사", "고맙", "응원", "대박",
+    "완벽", "유익", "도움", "신기", "예쁘다", "예뻐", "귀엽", "성공", "기대", "존경",
+    # 영어
+    "good", "great", "best", "awesome", "amazing", "excellent", "love", "like", "fun",
+    "funny", "helpful", "useful", "thanks", "thank", "beautiful", "perfect", "wow", "nice",
+}
+
+NEGATIVE_WORDS = {
+    # 한국어
+    "싫다", "싫어", "별로", "최악", "나쁘다", "나빠", "실망", "화나다", "화나", "짜증",
+    "재미없다", "노잼", "답답", "불편", "문제", "오류", "거짓", "무섭", "슬프", "혐오",
+    "망했다", "실패", "아쉽", "걱정", "비추천", "지루", "심각", "욕", "쓰레기",
+    # 영어
+    "bad", "worst", "hate", "boring", "disappointing", "angry", "annoying", "problem",
+    "error", "fail", "failed", "sad", "terrible", "awful", "poor", "scam", "fake",
+}
+
+POSITIVE_EMOJIS = {"😀", "😃", "😄", "😁", "😊", "😍", "🥰", "👍", "❤️", "❤", "🔥", "👏", "🎉", "✨", "💯"}
+NEGATIVE_EMOJIS = {"😡", "🤬", "😠", "😢", "😭", "👎", "💔", "😞", "😒", "🤮"}
+
+STOPWORDS = {
+    # 한국어
+    "이", "그", "저", "것", "수", "등", "더", "좀", "잘", "정말", "진짜", "너무", "영상",
+    "유튜브", "댓글", "사람", "하는", "하고", "해서", "하면", "있는", "없는", "입니다",
+    "있다", "없다", "같다", "그리고", "하지만", "에서", "으로", "에게", "까지", "부터",
+    "ㅋㅋ", "ㅋㅋㅋ", "ㅎㅎ", "ㅎㅎㅎ", "ㅠㅠ", "ㅜㅜ",
+    # 영어
+    "the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "to", "of", "in",
+    "on", "for", "with", "this", "that", "it", "you", "i", "we", "they", "my", "your",
+    "video", "youtube", "comment",
+}
+
+
+def extract_video_id(url_or_id: str) -> str | None:
+    """유튜브 URL 또는 11자리 영상 ID에서 videoId를 추출합니다."""
+    value = url_or_id.strip()
+    if re.fullmatch(r"[\w-]{11}", value):
+        return value
+
+    try:
+        parsed = urlparse(value)
+        host = parsed.netloc.lower().replace("www.", "")
+
+        if host == "youtu.be":
+            candidate = parsed.path.strip("/").split("/")[0]
+        elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+            if parsed.path == "/watch":
+                candidate = parse_qs(parsed.query).get("v", [""])[0]
+            elif parsed.path.startswith(("/shorts/", "/embed/", "/live/")):
+                parts = parsed.path.strip("/").split("/")
+                candidate = parts[1] if len(parts) > 1 else ""
+            else:
+                candidate = ""
+        else:
+            candidate = ""
+
+        return candidate if re.fullmatch(r"[\w-]{11}", candidate) else None
+    except Exception:
         return None
-    patterns = [
-        r"(?:v=|\/v\/|youtu\.be\/|\/embed\/|\/shorts\/|e\/|screen\/|user\/(?:.*)\/video\/)([^#\&\?]*)"
+
+
+def youtube_get(endpoint: str, params: dict) -> dict:
+    response = requests.get(
+        f"{YOUTUBE_API_BASE}/{endpoint}",
+        params=params,
+        timeout=20,
+    )
+    if response.ok:
+        return response.json()
+
+    try:
+        error_data = response.json()
+        message = error_data.get("error", {}).get("message", response.text)
+    except ValueError:
+        message = response.text
+    raise RuntimeError(f"YouTube API 오류 ({response.status_code}): {message}")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_video_info(api_key: str, video_id: str) -> dict:
+    data = youtube_get(
+        "videos",
+        {
+            "part": "snippet,statistics",
+            "id": video_id,
+            "key": api_key,
+        },
+    )
+    if not data.get("items"):
+        raise RuntimeError("영상을 찾을 수 없습니다. 링크, 공개 상태 또는 API 키를 확인하세요.")
+
+    item = data["items"][0]
+    snippet = item["snippet"]
+    statistics = item.get("statistics", {})
+    return {
+        "title": snippet.get("title", ""),
+        "channel": snippet.get("channelTitle", ""),
+        "published_at": snippet.get("publishedAt", ""),
+        "thumbnail": snippet.get("thumbnails", {}).get("high", {}).get("url", ""),
+        "view_count": int(statistics.get("viewCount", 0)),
+        "like_count": int(statistics.get("likeCount", 0)),
+        "comment_count": int(statistics.get("commentCount", 0)),
+    }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_comments(api_key: str, video_id: str, requested_count: int, order: str) -> pd.DataFrame:
+    rows = []
+    next_page_token = None
+
+    while len(rows) < requested_count:
+        page_size = min(100, requested_count - len(rows))
+        params = {
+            "part": "snippet,replies",
+            "videoId": video_id,
+            "maxResults": page_size,
+            "order": order,
+            "textFormat": "plainText",
+            "key": api_key,
+        }
+        if next_page_token:
+            params["pageToken"] = next_page_token
+
+        data = youtube_get("commentThreads", params)
+
+        for item in data.get("items", []):
+            thread_snippet = item.get("snippet", {})
+            top = thread_snippet.get("topLevelComment", {}).get("snippet", {})
+            rows.append(
+                {
+                    "author": top.get("authorDisplayName", ""),
+                    "comment": html.unescape(top.get("textDisplay", "")),
+                    "published_at": top.get("publishedAt"),
+                    "updated_at": top.get("updatedAt"),
+                    "like_count": int(top.get("likeCount", 0)),
+                    "reply_count": int(thread_snippet.get("totalReplyCount", 0)),
+                }
+            )
+            if len(rows) >= requested_count:
+                break
+
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token or not data.get("items"):
+            break
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["published_at"] = pd.to_datetime(df["published_at"], utc=True, errors="coerce")
+        df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True, errors="coerce")
+    return df
+
+
+def tokenize(text: str) -> list[str]:
+    cleaned = re.sub(r"https?://\S+|www\.\S+", " ", text.lower())
+    cleaned = re.sub(r"[^0-9a-zA-Z가-힣ㄱ-ㅎㅏ-ㅣ']", " ", cleaned)
+    return [token for token in cleaned.split() if len(token) >= 2]
+
+
+def sentiment_result(text: str) -> tuple[str, int]:
+    tokens = tokenize(text)
+    positive = sum(
+        1 for token in tokens
+        if token in POSITIVE_WORDS or any(word in token for word in POSITIVE_WORDS if len(word) >= 2)
+    )
+    negative = sum(
+        1 for token in tokens
+        if token in NEGATIVE_WORDS or any(word in token for word in NEGATIVE_WORDS if len(word) >= 2)
+    )
+    positive += sum(text.count(emoji) for emoji in POSITIVE_EMOJIS)
+    negative += sum(text.count(emoji) for emoji in NEGATIVE_EMOJIS)
+    score = positive - negative
+
+    if score > 0:
+        return "긍정", score
+    if score < 0:
+        return "부정", score
+    return "중립", 0
+
+
+def choose_time_granularity(df: pd.DataFrame) -> str:
+    valid = df["published_at"].dropna()
+    if valid.empty:
+        return "일별"
+    span = valid.max() - valid.min()
+    if span <= pd.Timedelta(days=3):
+        return "시간별"
+    if span <= pd.Timedelta(days=120):
+        return "일별"
+    if span <= pd.Timedelta(days=730):
+        return "월별"
+    return "연도별"
+
+
+def aggregate_time(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
+    temp = df.dropna(subset=["published_at"]).copy()
+    if temp.empty:
+        return pd.DataFrame(columns=["작성 시점", "댓글 수"])
+
+    if granularity == "시간별":
+        temp["작성 시점"] = temp["published_at"].dt.floor("h")
+    elif granularity == "일별":
+        temp["작성 시점"] = temp["published_at"].dt.floor("d")
+    elif granularity == "월별":
+        temp["작성 시점"] = temp["published_at"].dt.tz_convert(None).dt.to_period("M").dt.to_timestamp()
+    else:
+        temp["작성 시점"] = temp["published_at"].dt.year.astype(str)
+
+    return temp.groupby("작성 시점").size().reset_index(name="댓글 수")
+
+
+def find_korean_font() -> str | None:
+    candidates = [
+        "youtube/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "C:/Windows/Fonts/malgun.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            video_id = match.group(1)
-            if len(video_id) == 11:
-                return video_id
-    if "watch?v=" in url:
-        return url.split("watch?v=")[1].split("&")[0]
-    elif "youtu.be/" in url:
-        return url.split("youtu.be/")[1].split("?")[0]
-    elif "shorts/" in url:
-        return url.split("shorts/")[1].split("?")[0]
+    for path in candidates:
+        try:
+            with open(path, "rb"):
+                return path
+        except OSError:
+            continue
     return None
 
-# 유튜브 댓글을 가져오는 함수
-def get_youtube_comments(api_key, video_id, max_results):
-    youtube = build("youtube", "v3", developerKey=api_key)
-    comments = []
-    try:
-        request = youtube.commentThreads().list(
-            part="snippet",
-            videoId=video_id,
-            maxResults=min(max_results, 100),
-            textFormat="plainText"
-        )
-        while request and len(comments) < max_results:
-            response = request.execute()
-            for item in response['items']:
-                comment_data = item['snippet']['topLevelComment']['snippet']
-                comments.append({
-                    'author': comment_data['authorDisplayName'],
-                    'comment': comment_data['textDisplay'],
-                    'published_at': comment_data['publishedAt'],
-                    'like_count': comment_data['likeCount']
-                })
-            if 'nextPageToken' in response and len(comments) < max_results:
-                request = youtube.commentThreads().list(
-                    part="snippet",
-                    videoId=video_id,
-                    pageToken=response['nextPageToken'],
-                    maxResults=min(max_results - len(comments), 100),
-                    textFormat="plainText"
-                )
-            else:
-                break
-        return pd.DataFrame(comments)
-    except Exception as e:
-        st.error(f"유튜브 API 호출 중 오류가 발생했습니다: {e}")
-        return None
 
-# --- 실행 로직 ---
-if video_url:
-    video_id = extract_video_id(video_url)
-    
-    if video_id:
-        st.video(video_url)
-        
-        if not api_key:
-            st.warning("👈 왼쪽 사이드바에 YouTube API Key를 입력해 주세요.")
-        else:
-            with st.spinner("댓글 데이터를 수집하고 분석하는 중입니다..."):
-                df = get_youtube_comments(api_key, video_id, max_comments)
-                
-                if df is not None and not df.empty:
-                    df['published_at'] = pd.to_datetime(df['published_at'])
-                    df['date_hour'] = df['published_at'].dt.strftime('%Y-%m-%d %H시')
-                    
-                    st.success(f"총 {len(df)}개의 댓글을 불러왔습니다!")
-                    
-                    tab1, tab2, tab3 = st.tabs(["📈 시간대별 추이", "❤️ 댓글 반응도", "☁️ 한글 워드클라우드"])
-                    
-                    with tab1:
-                        st.subheader("시간대별 댓글 작성 추이")
-                        time_counts = df.groupby('date_hour').size().reset_index(name='댓글 수')
-                        time_counts = time_counts.sort_values('date_hour')
-                        st.line_chart(data=time_counts, x='date_hour', y='댓글 수')
-                    
-                    with tab2:
-                        st.subheader("가장 반응이 좋았던 댓글 (좋아요 순)")
-                        top_liked = df.sort_values(by='like_count', ascending=False).head(5)
-                        for idx, row in top_liked.iterrows():
-                            st.markdown(f"**👤 {row['author']}** (👍 좋아요 {row['like_count']}개)")
-                            st.info(row['comment'])
-                    
-                    with tab3:
-                        st.subheader("댓글 주요 키워드 (워드클라우드)")
-                        raw_text = " ".join(df['comment'].astype(str))
-                        clean_text = re.sub(r'[^가-힣\s]', '', raw_text)
-                        
-                        # JVM 경로가 지정된 상태에서 Okt 초기화 실행
-                        okt = Okt()
-                        nouns = okt.nouns(clean_text)
-                        nouns = [n for n in nouns if len(n) > 1]
-                        
-                        if nouns:
-                            count = Counter(nouns)
-                            try:
-                                wc = WordCloud(
-                                    font_path=FONT_PATH,
-                                    background_color="white",
-                                    width=800,
-                                    height=400
-                                ).generate_from_frequencies(count)
-                                
-                                fig, ax = plt.subplots(figsize=(10, 5))
-                                ax.imshow(wc, interpolation='bilinear')
-                                ax.axis('off')
-                                st.pyplot(fig)
-                            except Exception as e:
-                                st.error(f"워드클라우드 시각화 중 오류가 발생했습니다: {e}")
-                        else:
-                            st.write("분석할 만한 한글 단어(2글자 이상 명사)가 부족합니다.")
-                else:
-                    st.info("수집된 댓글이 없습니다. 영상 URL이나 댓글 허용 여부를 확인해 주세요.")
+def make_word_frequencies(comments: pd.Series, extra_stopwords: set[str]) -> Counter:
+    frequencies = Counter()
+    stopwords = STOPWORDS | extra_stopwords
+    for text in comments.fillna(""):
+        for token in tokenize(text):
+            if token not in stopwords and not token.isdigit():
+                frequencies[token] += 1
+    return frequencies
+
+
+st.markdown('<div class="main-title">💬 유튜브 댓글 분석기</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-title">영상 정보, 댓글 작성 추이, 반응도와 워드클라우드를 한 번에 분석합니다.</div>',
+    unsafe_allow_html=True,
+)
+
+with st.sidebar:
+    st.header("🔑 분석 설정")
+    api_key = st.secrets.get("YOUTUBE_API_KEY")
+
+    if api_key:
+        st.success("✅ API 키가 자동으로 연결되었습니다.")
     else:
-        st.error("올바른 유튜브 URL 형식이 아닙니다. 링크를 다시 확인해 주세요.")
+        st.error("Secrets에 YOUTUBE_API_KEY를 등록하세요.")
+        st.stop()
+        
+    video_url = st.text_input(
+        "유튜브 영상 링크",
+        placeholder="https://www.youtube.com/watch?v=...",
+    )
+    requested_count = st.number_input(
+        "가져올 댓글 개수",
+        min_value=10,
+        max_value=5000,
+        value=300,
+        step=50,
+        help="공개된 최상위 댓글을 가져옵니다. API 페이지당 최대 100개씩 요청됩니다.",
+    )
+    order_label = st.radio(
+        "댓글 수집 순서",
+        ["최신순", "관련도순"],
+        horizontal=True,
+        help="관련도순은 유튜브가 판단한 대표 댓글을 우선 수집합니다.",
+    )
+    extra_stopwords_text = st.text_input(
+        "추가 제외 단어",
+        placeholder="예: 채널명, 출연자명",
+        help="쉼표로 여러 단어를 구분하세요.",
+    )
+    analyze_clicked = st.button("🚀 댓글 분석하기", type="primary", use_container_width=True)
+
+video_id = extract_video_id(video_url) if video_url else None
+
+if video_url and video_id:
+    st.video(f"https://www.youtube.com/watch?v={video_id}")
+elif video_url:
+    st.warning("올바른 유튜브 영상 링크 또는 11자리 영상 ID를 입력하세요.")
+
+if analyze_clicked:
+    if not api_key:
+        st.error("YouTube Data API 키를 입력하세요.")
+        st.stop()
+    if not video_id:
+        st.error("올바른 유튜브 영상 링크를 입력하세요.")
+        st.stop()
+
+    order = "time" if order_label == "최신순" else "relevance"
+
+    try:
+        with st.spinner("영상 정보와 댓글을 불러오는 중입니다..."):
+            video_info = get_video_info(api_key, video_id)
+            comments_df = get_comments(api_key, video_id, int(requested_count), order)
+    except Exception as error:
+        st.error(str(error))
+        st.info(
+            "API 키 제한 설정, YouTube Data API v3 활성화 여부, 영상의 댓글 허용 여부를 확인하세요."
+        )
+        st.stop()
+
+    if comments_df.empty:
+        st.warning("가져올 수 있는 공개 댓글이 없습니다. 댓글이 비활성화되었거나 공개 댓글이 없을 수 있습니다.")
+        st.stop()
+
+    comments_df[["sentiment", "sentiment_score"]] = comments_df["comment"].apply(
+        lambda text: pd.Series(sentiment_result(text))
+    )
+    comments_df["engagement_score"] = comments_df["like_count"] + comments_df["reply_count"] * 2
+
+    st.session_state["comments_df"] = comments_df
+    st.session_state["video_info"] = video_info
+    st.session_state["extra_stopwords"] = extra_stopwords_text
+
+if "comments_df" in st.session_state:
+    df = st.session_state["comments_df"].copy()
+    info = st.session_state["video_info"]
+    extra_stopwords = {
+        word.strip().lower()
+        for word in st.session_state.get("extra_stopwords", "").split(",")
+        if word.strip()
+    }
+
+    st.subheader(info["title"])
+    st.caption(
+        f"채널: {info['channel']} · 분석 댓글: {len(df):,}개 · "
+        f"공개 전체 댓글: {info['comment_count']:,}개"
+    )
+
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("조회 수", f"{info['view_count']:,}")
+    metric_cols[1].metric("영상 좋아요", f"{info['like_count']:,}")
+    metric_cols[2].metric("분석 댓글", f"{len(df):,}")
+    metric_cols[3].metric("댓글 좋아요 합계", f"{df['like_count'].sum():,}")
+    metric_cols[4].metric("답글 합계", f"{df['reply_count'].sum():,}")
+
+    st.divider()
+    st.subheader("📈 시간대별 댓글 작성 추이")
+
+    default_granularity = choose_time_granularity(df)
+    granularity_options = ["시간별", "일별", "월별", "연도별"]
+    granularity = st.selectbox(
+        "집계 단위",
+        granularity_options,
+        index=granularity_options.index(default_granularity),
+    )
+    trend_df = aggregate_time(df, granularity)
+
+    if trend_df.empty:
+        st.info("작성 시점 데이터가 없어 추이를 표시할 수 없습니다.")
+    else:
+        trend_fig = px.line(
+            trend_df,
+            x="작성 시점",
+            y="댓글 수",
+            markers=True,
+            title=f"{granularity} 댓글 수",
+        )
+        trend_fig.update_layout(hovermode="x unified")
+        st.plotly_chart(trend_fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("💗 댓글 반응도")
+
+    left, right = st.columns(2)
+    with left:
+        sentiment_counts = (
+            df["sentiment"]
+            .value_counts()
+            .reindex(["긍정", "중립", "부정"], fill_value=0)
+            .reset_index()
+        )
+        sentiment_counts.columns = ["감성", "댓글 수"]
+        sentiment_fig = px.pie(
+            sentiment_counts,
+            names="감성",
+            values="댓글 수",
+            hole=0.45,
+            title="댓글 감성 분포",
+        )
+        st.plotly_chart(sentiment_fig, use_container_width=True)
+
+    with right:
+        reaction_summary = pd.DataFrame(
+            {
+                "반응": ["댓글 좋아요", "답글"],
+                "수": [int(df["like_count"].sum()), int(df["reply_count"].sum())],
+            }
+        )
+        reaction_fig = px.bar(
+            reaction_summary,
+            x="반응",
+            y="수",
+            text_auto=True,
+            title="좋아요·답글 반응",
+        )
+        st.plotly_chart(reaction_fig, use_container_width=True)
+
+    positive_ratio = (df["sentiment"] == "긍정").mean() * 100
+    negative_ratio = (df["sentiment"] == "부정").mean() * 100
+    avg_likes = df["like_count"].mean()
+    avg_replies = df["reply_count"].mean()
+
+    score_cols = st.columns(4)
+    score_cols[0].metric("긍정 비율", f"{positive_ratio:.1f}%")
+    score_cols[1].metric("부정 비율", f"{negative_ratio:.1f}%")
+    score_cols[2].metric("평균 댓글 좋아요", f"{avg_likes:.1f}")
+    score_cols[3].metric("평균 답글 수", f"{avg_replies:.1f}")
+
+    st.caption(
+        "감성 분류는 한국어·영어 키워드와 이모지를 활용한 간단한 사전 기반 분석입니다. "
+        "반어법, 신조어, 문맥에 따라 실제 의미와 다를 수 있습니다."
+    )
+
+    st.divider()
+    st.subheader("☁️ 댓글 워드클라우드")
+
+    frequencies = make_word_frequencies(df["comment"], extra_stopwords)
+    min_frequency = st.slider("워드클라우드 최소 등장 횟수", 1, 20, 2)
+    filtered_freq = Counter({word: count for word, count in frequencies.items() if count >= min_frequency})
+
+    if not filtered_freq:
+        st.info("조건을 만족하는 단어가 없습니다. 최소 등장 횟수를 낮춰보세요.")
+    else:
+        font_path = find_korean_font()
+        wordcloud = WordCloud(
+            width=1400,
+            height=700,
+            background_color="white",
+            font_path=font_path,
+            max_words=150,
+            collocations=False,
+        ).generate_from_frequencies(filtered_freq)
+
+        fig, ax = plt.subplots(figsize=(14, 7))
+        ax.imshow(wordcloud, interpolation="bilinear")
+        ax.axis("off")
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+        top_words = pd.DataFrame(frequencies.most_common(20), columns=["단어", "등장 횟수"])
+        top_words_fig = px.bar(
+            top_words.sort_values("등장 횟수"),
+            x="등장 횟수",
+            y="단어",
+            orientation="h",
+            title="상위 20개 단어",
+        )
+        st.plotly_chart(top_words_fig, use_container_width=True)
+
+    st.divider()
+    st.subheader("🏆 반응이 큰 댓글")
+    top_n = st.slider("표시할 댓글 수", 5, 30, 10)
+    display_df = (
+        df.nlargest(top_n, "engagement_score")[
+            ["author", "comment", "published_at", "like_count", "reply_count", "sentiment"]
+        ]
+        .rename(
+            columns={
+                "author": "작성자",
+                "comment": "댓글",
+                "published_at": "작성 시각",
+                "like_count": "좋아요",
+                "reply_count": "답글",
+                "sentiment": "감성",
+            }
+        )
+    )
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    csv_df = df.rename(
+        columns={
+            "author": "작성자",
+            "comment": "댓글",
+            "published_at": "작성 시각",
+            "updated_at": "수정 시각",
+            "like_count": "좋아요",
+            "reply_count": "답글",
+            "sentiment": "감성",
+            "sentiment_score": "감성 점수",
+            "engagement_score": "반응 점수",
+        }
+    )
+    csv_data = csv_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+    st.download_button(
+        "📥 분석 댓글 CSV 다운로드",
+        data=csv_data,
+        file_name=f"youtube_comments_{video_id}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+else:
+    st.info("왼쪽 설정에서 API 키와 영상 링크를 입력한 뒤 **댓글 분석하기**를 누르세요.")
+
+with st.expander("YouTube Data API 키 발급 안내"):
+    st.markdown(
+        """
+        1. Google Cloud Console에서 프로젝트를 만듭니다.
+        2. **API 및 서비스 → 라이브러리**에서 **YouTube Data API v3**를 활성화합니다.
+        3. **사용자 인증 정보 → 사용자 인증 정보 만들기 → API 키**를 선택합니다.
+        4. 발급된 키를 이 앱의 사이드바에 입력합니다.
+        5. 공개 배포 시에는 Google Cloud Console에서 API 키의 사용 제한을 설정하는 것이 좋습니다.
+        """
+    )
